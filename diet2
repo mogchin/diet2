@@ -10,7 +10,14 @@ load_dotenv()
 # 環境変数から設定を読み込む
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-TARGET_CHANNEL_ID = 839806186533421076 # あなたのチャンネルID
+
+# 監視対象チャンネルとその採点モード
+# 839806186533421076: ダイエットの採点
+# 1381617555529142333: 栄養の採点
+CHANNEL_MODES = {
+    839806186533421076: "diet",
+    1381617555529142333: "nutrition",
+}
 
 # Gemini APIの設定
 if GEMINI_API_KEY:
@@ -50,7 +57,7 @@ def parse_meal_data(message_content: str) -> dict:
             data[key.strip("【】")] = "" # 見つからない場合は空文字
     return data
 
-async def analyze_meal_with_gemini(meal_data: dict) -> str:
+async def analyze_meal_with_gemini(meal_data: dict, mode: str) -> str:
     """
     Gemini APIを使用して食事内容を評価する。
     """
@@ -64,9 +71,16 @@ async def analyze_meal_with_gemini(meal_data: dict) -> str:
     sonota = meal_data.get("その他", "記載なし")
     strictness = meal_data.get("採点の厳しさ", "普通") # デフォルトは普通
 
+    if mode == "nutrition":
+        role = "あなたはプロの栄養士です。副業で占いもできます。"
+        description = "以下の食事内容を栄養バランスの観点から100点満点で採点し、良い点や改善点を簡潔に述べてください。"
+    else:
+        role = "あなたはプロの栄養士であり、ダイエット指導の専門家です。副業で占いもできます。"
+        description = "以下の食事内容を、指定された採点の厳しさに従って100点満点で評価し、具体的なアドバイスもあれば簡潔に述べてください。"
+
     prompt = f"""
-あなたはプロの栄養士であり、ダイエット指導の専門家です。副業で占いもできます。
-以下の食事内容を、指定された採点の厳しさに従って100点満点で評価し、具体的なアドバイスもあれば簡潔に述べてください。
+{role}
+{description}
 【点数】、【良い点】、【アドバイス】、【総評】、【明日の運勢！】の順で見やすい形で教えてください。
 占いは食事内容を参考に運勢を変えてよいが、占い文面には食品名・料理名・栄養素を一切書かない
 
@@ -112,7 +126,8 @@ async def analyze_meal_with_gemini(meal_data: dict) -> str:
 @client.event
 async def on_ready():
     print(f'{client.user} としてログインしました。')
-    print(f'監視対象チャンネルID: {TARGET_CHANNEL_ID}')
+    ids = ", ".join(str(cid) for cid in CHANNEL_MODES.keys())
+    print(f'監視対象チャンネルID: {ids}')
     if not model:
         print("警告: Gemini APIが設定されていないため、評価機能は動作しません。")
 
@@ -123,7 +138,8 @@ async def on_message(message):
         return
 
     # 特定のチャンネルのメッセージのみを処理
-    if message.channel.id == TARGET_CHANNEL_ID:
+    if message.channel.id in CHANNEL_MODES:
+        mode = CHANNEL_MODES[message.channel.id]
         print(f"チャンネル ({message.channel.name}) にメッセージが投稿されました: {message.content[:50]}...") # 内容の一部をログに表示
 
         # メッセージがテンプレート形式か簡易的にチェック
@@ -154,7 +170,7 @@ async def on_message(message):
                     return
 
                 # Gemini APIで分析・評価
-                evaluation_result = await analyze_meal_with_gemini(meal_data)
+                evaluation_result = await analyze_meal_with_gemini(meal_data, mode)
 
                 # スレッド名を設定 (日付があればそれを使用し、投稿者名も追加)
                 date_for_thread_name = meal_data.get("日付", "日付不明") # キー名を修正
