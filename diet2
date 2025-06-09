@@ -57,7 +57,7 @@ def parse_meal_data(message_content: str) -> dict:
             data[key.strip("【】")] = "" # 見つからない場合は空文字
     return data
 
-async def analyze_meal_with_gemini(meal_data: dict) -> str:
+async def analyze_meal_with_gemini(meal_data: dict, mode: str) -> str:
     """
     Gemini APIを使用して食事内容を評価する。
     """
