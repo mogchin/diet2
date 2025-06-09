@@ -1,0 +1,189 @@
+import discord
+import google.generativeai as genai
+import os
+import re
+from dotenv import load_dotenv
+
+# .envファイルから環境変数を読み込む
+load_dotenv()
+
+# 環境変数から設定を読み込む
+DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+TARGET_CHANNEL_ID = 839806186533421076 # あなたのチャンネルID
+
+# Gemini APIの設定
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
+else:
+    print("エラー: GEMINI_API_KEYが設定されていません。")
+    model = None # modelがNoneの場合、API呼び出しをスキップする
+
+# Discordクライアントの初期化
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True # メッセージ内容の読み取りに必要
+client = discord.Client(intents=intents)
+
+TEMPLATE_KEYS = ["【日付】", "【朝】", "【昼】", "【夜】", "【その他】", "【採点の厳しさ】"]
+
+def parse_meal_data(message_content: str) -> dict:
+    """
+    メッセージ内容を解析し、食事データを辞書として抽出する。
+    """
+    data = {}
+    # 正規表現で各項目を抽出
+    for i, key in enumerate(TEMPLATE_KEYS):
+        next_key_lookahead = ""
+        if i + 1 < len(TEMPLATE_KEYS):
+            # 次のキーの直前までをマッチ (大文字・小文字を区別しない)
+            next_key_lookahead = f"(?={re.escape(TEMPLATE_KEYS[i+1])})"
+
+        # キーと内容のパターン (キーの後の空白は任意、内容は改行を含む)
+        # キー自体も大文字・小文字を区別しない
+        pattern = rf"{re.escape(key)}\s*(.*?)\s*({next_key_lookahead}|\Z)"
+        match = re.search(pattern, message_content, re.DOTALL | re.IGNORECASE)
+        if match:
+            data[key.strip("【】")] = match.group(1).strip()
+        else:
+            data[key.strip("【】")] = "" # 見つからない場合は空文字
+    return data
+
+async def analyze_meal_with_gemini(meal_data: dict) -> str:
+    """
+    Gemini APIを使用して食事内容を評価する。
+    """
+    if not model:
+        return "Gemini APIキーが設定されていないため、評価できません。"
+
+    date_val = meal_data.get("日付", "不明") # キー名を修正
+    asa = meal_data.get("朝", "記載なし")
+    hiru = meal_data.get("昼", "記載なし")
+    yoru = meal_data.get("夜", "記載なし")
+    sonota = meal_data.get("その他", "記載なし")
+    strictness = meal_data.get("採点の厳しさ", "普通") # デフォルトは普通
+
+    prompt = f"""
+あなたはプロの栄養士であり、ダイエット指導の専門家です。副業で占いもできます。
+以下の食事内容を、指定された採点の厳しさに従って100点満点で評価し、具体的なアドバイスもあれば簡潔に述べてください。
+【点数】、【良い点】、【アドバイス】、【総評】、【明日の運勢！】の順で見やすい形で教えてください。
+占いは食事内容を参考に運勢を変えてよいが、占い文面には食品名・料理名・栄養素を一切書かない
+
+例：
+明日の運勢！
+【恋愛運】★★★☆☆
+　
+【金運】★★★☆☆
+　
+【仕事運】★★★☆☆
+　
+【ラッキーアイテム】
+
+【日付】{date_val}
+【食事内容】
+朝：{asa}
+昼：{hiru}
+夜：{yoru}
+その他：{sonota}
+
+【採点の厳しさ】
+{strictness}
+
+
+"""
+    try:
+        response = await model.generate_content_async(prompt) # 非同期で実行
+        if hasattr(response, 'text'):
+            return response.text
+        elif response.parts: #念のため旧形式も考慮
+             return "".join(part.text for part in response.parts)
+        else:
+            # Gemini APIのレスポンス構造によっては、以下のようにアクセスする必要があるかもしれません
+            # (これはAPIのバージョンやレスポンス形式によって変わる可能性があります)
+            # 例: response.candidates[0].content.parts[0].text
+            # ここでは response.text または response.parts が利用可能であることを期待します
+            return "APIからのレスポンス形式が予期したものと異なります。管理者に確認してください。"
+
+    except Exception as e:
+        print(f"Gemini APIエラー: {e}")
+        return f"食事内容の分析中にエラーが発生しました: {e}"
+
+@client.event
+async def on_ready():
+    print(f'{client.user} としてログインしました。')
+    print(f'監視対象チャンネルID: {TARGET_CHANNEL_ID}')
+    if not model:
+        print("警告: Gemini APIが設定されていないため、評価機能は動作しません。")
+
+@client.event
+async def on_message(message):
+    # ボット自身のメッセージは無視
+    if message.author == client.user:
+        return
+
+    # 特定のチャンネルのメッセージのみを処理
+    if message.channel.id == TARGET_CHANNEL_ID:
+        print(f"チャンネル ({message.channel.name}) にメッセージが投稿されました: {message.content[:50]}...") # 内容の一部をログに表示
+
+        # メッセージがテンプレート形式か簡易的にチェック
+        # (全てのキーが含まれているか。大文字・小文字を区別しない)
+        # 少なくとも「日付」と「朝」のキーがあるかで判断（より厳密なチェックも可能）
+        is_template = all(re.search(re.escape(key), message.content, re.IGNORECASE) for key in TEMPLATE_KEYS[:2])
+
+        if is_template:
+            async with message.channel.typing(): # "入力中..." を表示
+                meal_data = parse_meal_data(message.content)
+
+                # 必須項目チェック（例：朝昼夜のいずれかが入力されているか）
+                if not meal_data.get("朝") and not meal_data.get("昼") and not meal_data.get("夜"):
+                    error_message_content = "食事内容が入力されていないようです。朝・昼・夜のいずれかを入力してください。"
+                    error_thread_name = f"入力エラー - {message.author.display_name}"
+                    try:
+                        error_thread = await message.create_thread(name=error_thread_name[:100]) # スレッド名上限100文字
+                        await error_thread.send(error_message_content)
+                    except discord.HTTPException as e:
+                        print(f"入力エラー時のスレッド作成またはメッセージ送信に失敗: {e}")
+                        await message.reply(error_message_content + " (スレッド作成失敗)")
+                    return
+
+                print(f"解析された食事データ: {meal_data}") # 解析結果をログに
+
+                if not model: # Gemini APIが未設定の場合
+                    await message.reply("Gemini APIが設定されていないため、評価機能を利用できません。")
+                    return
+
+                # Gemini APIで分析・評価
+                evaluation_result = await analyze_meal_with_gemini(meal_data)
+
+                # スレッド名を設定 (日付があればそれを使用し、投稿者名も追加)
+                date_for_thread_name = meal_data.get("日付", "日付不明") # キー名を修正
+                thread_name = f"食事評価 ({date_for_thread_name}) - {message.author.display_name}"
+                # Discordのスレッド名の文字数制限は100文字です
+                if len(thread_name) > 100:
+                    thread_name = thread_name[:97] + "..." # 97文字 + "..."
+
+                try:
+                    # メッセージに対してスレッドを作成
+                    created_thread = await message.create_thread(name=thread_name)
+                    # 作成したスレッドに評価結果を送信
+                    await created_thread.send(evaluation_result)
+                except discord.HTTPException as e:
+                    # スレッド作成や送信に失敗した場合のフォールバック (例: 通常のリプライ)
+                    print(f"スレッドの作成またはメッセージの送信に失敗しました: {e}")
+                    await message.reply(f"（スレッド作成に失敗しました。権限等を確認してください。）\n{evaluation_result}")
+                except Exception as e:
+                    # その他の予期せぬエラー
+                    print(f"スレッド処理中に予期せぬエラーが発生しました: {e}")
+                    await message.reply(f"（評価処理中に予期せぬエラーが発生しました。）\n{evaluation_result}")
+        else:
+            # テンプレート形式でない場合は何もしないか、ユーザーに通知する
+            # 今回は何もしない設定
+            print("テンプレート形式ではないため、処理をスキップしました。")
+            pass
+
+if DISCORD_BOT_TOKEN:
+    client.run(DISCORD_BOT_TOKEN)
+else:
+    print("エラー: DISCORD_BOT_TOKEN が設定されていません。")
+    print(".envファイルを確認してください。")
